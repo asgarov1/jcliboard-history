@@ -25,6 +25,7 @@ public class ClipboardWatcher {
     private static String lastValue = "";
     private static JDialog popupWindow;
     private static JTextField searchField;
+    private static volatile boolean suppressSearch = false;
     private static JPanel listPanel;
     private static JScrollPane listScroll;
 
@@ -107,6 +108,12 @@ public class ClipboardWatcher {
 
     private static void startClipboardPoller() {
         Thread t = new Thread(() -> {
+            // Use 150ms normally; after detecting a new value we burst-poll at 50ms
+            // for a short window — this catches Citrix/RDP clipboard sync that arrives
+            // in multiple rounds (first round may be empty or partial).
+            int sleepMs = 150;
+            int burstRemaining = 0;
+
             while (true) {
                 try {
                     Clipboard clipboard = Toolkit.getDefaultToolkit().getSystemClipboard();
@@ -122,12 +129,23 @@ public class ClipboardWatcher {
                             }
                             saveHistory();
                             System.out.println("Copied: " + data.substring(0, Math.min(60, data.length())).replace("\n", "↵"));
+                            // Burst-poll for 1 second after a new value — catches
+                            // Citrix sending a better/complete version shortly after
+                            burstRemaining = 20; // 20 x 50ms = 1s burst
                         }
                     }
                 } catch (IllegalStateException ignored) {
-                    // clipboard temporarily locked by another app
+                    // clipboard temporarily locked — burst-poll to catch the release
+                    burstRemaining = 10;
                 } catch (Exception ignored) {}
-                try { Thread.sleep(200); } catch (InterruptedException ignored) {}
+
+                if (burstRemaining > 0) {
+                    burstRemaining--;
+                    sleepMs = 50;
+                } else {
+                    sleepMs = 150;
+                }
+                try { Thread.sleep(sleepMs); } catch (InterruptedException ignored) {}
             }
         });
         t.setDaemon(true);
@@ -281,7 +299,7 @@ public class ClipboardWatcher {
             searchField.setFont(new Font("Segoe UI", Font.PLAIN, 12));
             // Bright enough to read against the dark background
             searchField.setForeground(new Color(210, 215, 240));
-            searchField.setBackground(new Color(70, 70, 100));
+            searchField.setBackground(new Color(30, 30, 44));
             searchField.setCaretColor(new Color(160, 140, 255));
             // Use only an EmptyBorder — no LineBorder means no OS/L&F focus ring
             searchField.setBorder(new EmptyBorder(5, 10, 5, 10));
@@ -319,9 +337,9 @@ public class ClipboardWatcher {
             searchField.setText("Search…");
             searchField.setForeground(new Color(80, 80, 110));
             searchField.getDocument().addDocumentListener(new DocumentListener() {
-                public void insertUpdate(DocumentEvent e)  { refreshList(); }
-                public void removeUpdate(DocumentEvent e)  { refreshList(); }
-                public void changedUpdate(DocumentEvent e) { refreshList(); }
+                public void insertUpdate(DocumentEvent e)  { if (!suppressSearch) refreshList(); }
+                public void removeUpdate(DocumentEvent e)  { if (!suppressSearch) refreshList(); }
+                public void changedUpdate(DocumentEvent e) { if (!suppressSearch) refreshList(); }
             });
             // Esc from search field also closes
             searchField.addKeyListener(new KeyAdapter() {
@@ -397,13 +415,19 @@ public class ClipboardWatcher {
         SwingUtilities.invokeLater(() -> {
             if (popupWindow == null) return;
 
-            // Clear search
+            // Flush clipboard at show-time — catches Citrix/remote clipboard lag
+            // where the host X11 clipboard is updated after a short delay
+            flushClipboardNow();
+
+            // Reset search field without triggering the DocumentListener
+            suppressSearch = true;
             searchField.setText("Search…");
             searchField.setForeground(new Color(80, 80, 110));
+            suppressSearch = false;
 
-            refreshList();
+            refreshList(); // populates listPanel synchronously now
 
-            // Size: fixed width, height capped at POPUP_MAX_H
+            // Size after refreshList so listPanel.getComponentCount() is accurate
             Dimension screen = Toolkit.getDefaultToolkit().getScreenSize();
             int w = 560;
             int listCount = listPanel.getComponentCount();
@@ -440,45 +464,69 @@ public class ClipboardWatcher {
         });
     }
 
-    /** Rebuild the list panel based on current search text. */
+    /**
+     * Reads the clipboard right now and adds to history if it's new.
+     * Called at popup-show time to catch clipboard managers (Citrix, RDP, etc.)
+     * that sync to X11 with a delay — by the time the user triggers the popup,
+     * the poller may not have seen the latest value yet.
+     */
+    private static void flushClipboardNow() {
+        try {
+            Clipboard cb = Toolkit.getDefaultToolkit().getSystemClipboard();
+            Transferable t = cb.getContents(null);
+            if (t != null && t.isDataFlavorSupported(DataFlavor.stringFlavor)) {
+                String data = (String) t.getTransferData(DataFlavor.stringFlavor);
+                if (data != null && !data.isEmpty() && !data.equals(lastValue)) {
+                    lastValue = data;
+                    synchronized (history) {
+                        history.add(0, data);
+                        if (history.size() > MAX_HISTORY)
+                            history.remove(history.size() - 1);
+                    }
+                    saveHistory();
+                    System.out.println("Flushed at show-time: " + data.substring(0, Math.min(60, data.length())).replace("\n", "↵"));
+                }
+            }
+        } catch (Exception ignored) {}
+    }
+
+    /** Rebuild the list panel based on current search text. Must be called on the EDT. */
     private static void refreshList() {
-        SwingUtilities.invokeLater(() -> {
-            if (listPanel == null) return;
-            String query = searchField.getText().trim().toLowerCase();
-            boolean isPlaceholder = query.equals("search…") || query.isEmpty();
+        if (listPanel == null) return;
+        String query = searchField.getText().trim().toLowerCase();
+        boolean isPlaceholder = query.equals("search…") || query.isEmpty();
 
-            List<String> filtered;
-            synchronized (history) {
-                filtered = isPlaceholder
-                        ? new ArrayList<>(history)
-                        : history.stream()
-                        .filter(e -> e.toLowerCase().contains(query))
-                        .collect(Collectors.toList());
-            }
+        List<String> filtered;
+        synchronized (history) {
+            filtered = isPlaceholder
+                    ? new ArrayList<>(history)
+                    : history.stream()
+                    .filter(e -> e.toLowerCase().contains(query))
+                    .collect(Collectors.toList());
+        }
 
-            listPanel.removeAll();
-            if (filtered.isEmpty()) {
-                JLabel empty = new JLabel(isPlaceholder ? "  Nothing copied yet…" : "  No matches found");
-                empty.setFont(new Font("Segoe UI", Font.ITALIC, 12));
-                empty.setForeground(new Color(100, 100, 130));
-                empty.setBorder(new EmptyBorder(16, 16, 16, 16));
-                listPanel.add(empty);
-            } else {
-                for (int i = 0; i < filtered.size(); i++)
-                    listPanel.add(createHistoryItem(i, filtered.get(i)));
-            }
-            listPanel.revalidate();
-            listPanel.repaint();
+        listPanel.removeAll();
+        if (filtered.isEmpty()) {
+            JLabel empty = new JLabel(isPlaceholder ? "  Nothing copied yet…" : "  No matches found");
+            empty.setFont(new Font("Segoe UI", Font.ITALIC, 12));
+            empty.setForeground(new Color(100, 100, 130));
+            empty.setBorder(new EmptyBorder(16, 16, 16, 16));
+            listPanel.add(empty);
+        } else {
+            for (int i = 0; i < filtered.size(); i++)
+                listPanel.add(createHistoryItem(i, filtered.get(i)));
+        }
+        listPanel.revalidate();
+        listPanel.repaint();
 
-            // Resize popup height to fit new filtered count, still capped
-            if (popupWindow != null && popupWindow.isVisible()) {
-                int count = Math.max(1, filtered.isEmpty() ? 1 : filtered.size());
-                int naturalH = HEADER_H + SEARCH_H + count * ITEM_H + 8;
-                int h = Math.min(naturalH, POPUP_MAX_H);
-                Dimension cur = popupWindow.getSize();
-                popupWindow.setSize(cur.width, h);
-            }
-        });
+        // Resize popup height to fit new filtered count, still capped
+        if (popupWindow != null && popupWindow.isVisible()) {
+            int count = Math.max(1, filtered.isEmpty() ? 1 : filtered.size());
+            int naturalH = HEADER_H + SEARCH_H + count * ITEM_H + 8;
+            int h = Math.min(naturalH, POPUP_MAX_H);
+            Dimension cur = popupWindow.getSize();
+            popupWindow.setSize(cur.width, h);
+        }
     }
 
     /** Hides the popup and signals the trigger process to exit. */
