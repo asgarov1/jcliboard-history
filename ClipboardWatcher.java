@@ -23,7 +23,7 @@ public class ClipboardWatcher {
 
     private static final List<String> history = new ArrayList<>();
     private static String lastValue = "";
-    private static JWindow popupWindow;
+    private static JDialog popupWindow;
     private static JTextField searchField;
     private static JPanel listPanel;
     private static JScrollPane listScroll;
@@ -219,7 +219,8 @@ public class ClipboardWatcher {
 
     private static void buildPopupWindow() {
         SwingUtilities.invokeLater(() -> {
-            popupWindow = new JWindow();
+            popupWindow = new JDialog((Frame) null);
+            popupWindow.setUndecorated(true);
             popupWindow.setAlwaysOnTop(true);
             popupWindow.setFocusableWindowState(true);
 
@@ -243,7 +244,7 @@ public class ClipboardWatcher {
             JPanel hints = new JPanel(new FlowLayout(FlowLayout.RIGHT, 4, 0));
             hints.setOpaque(false);
 
-            JLabel hintCopy = new JLabel("Click to copy");
+            JLabel hintCopy = new JLabel("click to copy");
             hintCopy.setFont(new Font("Segoe UI", Font.PLAIN, 10));
             hintCopy.setForeground(new Color(100, 100, 130));
             hintCopy.addMouseListener(new MouseAdapter() {
@@ -255,7 +256,7 @@ public class ClipboardWatcher {
             sep.setFont(new Font("Segoe UI", Font.PLAIN, 10));
             sep.setForeground(new Color(60, 60, 80));
 
-            JLabel hintClose = new JLabel("Close");
+            JLabel hintClose = new JLabel("Esc to close");
             hintClose.setFont(new Font("Segoe UI", Font.PLAIN, 10));
             hintClose.setForeground(new Color(100, 100, 130));
             hintClose.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
@@ -276,6 +277,7 @@ public class ClipboardWatcher {
             searchBar.setBorder(new EmptyBorder(6, 12, 6, 12));
 
             searchField = new JTextField();
+            searchField.setFocusable(true);
             searchField.setFont(new Font("Segoe UI", Font.PLAIN, 12));
             searchField.setForeground(new Color(210, 215, 240));
             searchField.setBackground(new Color(30, 30, 44));
@@ -403,10 +405,14 @@ public class ClipboardWatcher {
             SwingUtilities.invokeLater(() ->
                     listScroll.getVerticalScrollBar().setValue(0));
 
-            // Focus the search field so you can type immediately
-            searchField.requestFocusInWindow();
-            popupWindow.requestFocus();
-            popupWindow.getRootPane().requestFocusInWindow();
+            // Focus the search field after the window is fully shown.
+            // A nested invokeLater is required on Linux/X11: the first pass
+            // makes the window visible, the second pass (next EDT cycle) is
+            // when the OS actually grants focus to child components.
+            SwingUtilities.invokeLater(() -> {
+                popupWindow.toFront();
+                searchField.requestFocusInWindow();
+            });
 
             popupWindow.setOpacity(0f);
             Timer fadeIn = new Timer(16, null);
