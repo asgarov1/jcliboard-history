@@ -279,30 +279,45 @@ public class ClipboardWatcher {
             searchField = new JTextField();
             searchField.setFocusable(true);
             searchField.setFont(new Font("Segoe UI", Font.PLAIN, 12));
+            // Bright enough to read against the dark background
             searchField.setForeground(new Color(210, 215, 240));
-            searchField.setBackground(new Color(30, 30, 44));
+            searchField.setBackground(new Color(70, 70, 100));
             searchField.setCaretColor(new Color(160, 140, 255));
-            searchField.setBorder(new CompoundBorder(
-                    new LineBorder(new Color(60, 55, 90), 1),
-                    new EmptyBorder(5, 10, 5, 10)
-            ));
-            // Placeholder text
-            searchField.setText("Search…");
-            searchField.setForeground(new Color(80, 80, 110));
+            // Use only an EmptyBorder — no LineBorder means no OS/L&F focus ring
+            searchField.setBorder(new EmptyBorder(5, 10, 5, 10));
+            // Override the L&F focus border that Metal/GTK themes paint inside the field
+            searchField.setUI(new javax.swing.plaf.basic.BasicTextFieldUI() {
+                @Override protected void paintSafely(Graphics g) {
+                    // paint background manually since we removed the border
+                    g.setColor(searchField.getBackground());
+                    g.fillRect(0, 0, searchField.getWidth(), searchField.getHeight());
+                    super.paintSafely(g);
+                }
+            });
+            // Single focus listener: handles placeholder text + accent border
             searchField.addFocusListener(new FocusAdapter() {
                 @Override public void focusGained(FocusEvent e) {
                     if (searchField.getText().equals("Search…")) {
                         searchField.setText("");
                         searchField.setForeground(new Color(210, 215, 240));
                     }
+                    searchField.setBorder(new CompoundBorder(
+                            new MatteBorder(0, 0, 1, 0, new Color(120, 100, 220)),
+                            new EmptyBorder(5, 10, 4, 10)));
+                    searchField.repaint();
                 }
                 @Override public void focusLost(FocusEvent e) {
                     if (searchField.getText().isEmpty()) {
                         searchField.setText("Search…");
                         searchField.setForeground(new Color(80, 80, 110));
                     }
+                    searchField.setBorder(new EmptyBorder(5, 10, 5, 10));
+                    searchField.repaint();
                 }
             });
+            // Placeholder text
+            searchField.setText("Search…");
+            searchField.setForeground(new Color(80, 80, 110));
             searchField.getDocument().addDocumentListener(new DocumentListener() {
                 public void insertUpdate(DocumentEvent e)  { refreshList(); }
                 public void removeUpdate(DocumentEvent e)  { refreshList(); }
