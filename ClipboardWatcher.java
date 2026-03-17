@@ -1,41 +1,112 @@
 import javax.swing.*;
 import javax.swing.border.*;
+import javax.swing.event.DocumentEvent;
+import javax.swing.event.DocumentListener;
 import java.awt.*;
 import java.awt.datatransfer.*;
 import java.awt.event.*;
 import java.io.*;
 import java.net.*;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.*;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.stream.Collectors;
 
 public class ClipboardWatcher {
 
-    private static final int MAX_HISTORY = 10;
+    private static final int MAX_HISTORY    = 100;
+    private static final int POPUP_MAX_H    = 600; // max popup height in px before scrolling
+    private static final int ITEM_H         = 54;
+    private static final int HEADER_H       = 44;
+    private static final int SEARCH_H       = 42;
+
     private static final List<String> history = new ArrayList<>();
     private static String lastValue = "";
     private static JWindow popupWindow;
+    private static JTextField searchField;
+    private static JPanel listPanel;
+    private static JScrollPane listScroll;
 
-    // When the popup was opened by a trigger process, we hold its socket open
-    // and send "closed" on it when the popup is dismissed — causing that process to exit.
     private static volatile PrintWriter triggerReplyWriter = null;
 
-    private static final Path TRIGGER_FILE =
+    // History file lives next to the .class / .java file
+    private static final Path HISTORY_FILE  = Paths.get("clipboard_history.txt");
+    private static final Path TRIGGER_FILE  =
             Paths.get(System.getProperty("user.home"), ".clipboard_trigger");
 
-    public static void main(String[] args) throws Exception {
+    // ─── Entry point ─────────────────────────────────────────────────────────
 
-        // ── If run with "trigger" argument, signal the running instance ──────
+    public static void main(String[] args) throws Exception {
         if (args.length > 0 && args[0].equals("trigger")) {
             sendSocketTrigger();
             return;
         }
 
         UIManager.setLookAndFeel(UIManager.getSystemLookAndFeelClassName());
-        // FlavorListener is unreliable on Linux (known JDK bug) -- misses rapid copies
-        // and sometimes never fires depending on the desktop environment.
-        // Polling every 200ms is the standard workaround and catches everything.
-        Thread clipboardPoller = new Thread(() -> {
+
+        loadHistory();
+
+        startClipboardPoller();
+        setupSystemTray();
+        buildPopupWindow();
+        startSocketListener();
+        startFileTriggerWatcher();
+
+        System.out.println("Clipboard Manager started. History: " + history.size() + " entries.");
+        System.out.println("  Trigger via command: java ClipboardWatcher trigger");
+        System.out.println("  Trigger via file   : touch " + TRIGGER_FILE);
+        System.out.println("  Bind either to a hotkey in GNOME/KDE: Settings → Keyboard → Custom Shortcuts");
+        Thread.sleep(Long.MAX_VALUE);
+    }
+
+    // ─── Persistence ─────────────────────────────────────────────────────────
+
+    private static void loadHistory() {
+        if (!Files.exists(HISTORY_FILE)) return;
+        try {
+            List<String> lines = Files.readAllLines(HISTORY_FILE, StandardCharsets.UTF_8);
+            // File format: entries separated by a sentinel line
+            String sentinel = "---ENTRY---";
+            List<String> current = new ArrayList<>();
+            for (String line : lines) {
+                if (line.equals(sentinel)) {
+                    if (!current.isEmpty()) {
+                        String entry = String.join("\n", current);
+                        history.add(entry);
+                        current.clear();
+                    }
+                } else {
+                    current.add(line);
+                }
+            }
+            if (!current.isEmpty()) history.add(String.join("\n", current));
+            if (!history.isEmpty()) lastValue = history.get(0);
+            System.out.println("Loaded " + history.size() + " history entries.");
+        } catch (Exception e) {
+            System.err.println("Could not load history: " + e.getMessage());
+        }
+    }
+
+    private static synchronized void saveHistory() {
+        try {
+            String sentinel = "---ENTRY---";
+            StringBuilder sb = new StringBuilder();
+            synchronized (history) {
+                for (String entry : history) {
+                    sb.append(entry).append("\n").append(sentinel).append("\n");
+                }
+            }
+            Files.writeString(HISTORY_FILE, sb.toString(), StandardCharsets.UTF_8);
+        } catch (Exception e) {
+            System.err.println("Could not save history: " + e.getMessage());
+        }
+    }
+
+    // ─── Clipboard polling ───────────────────────────────────────────────────
+
+    private static void startClipboardPoller() {
+        Thread t = new Thread(() -> {
             while (true) {
                 try {
                     Clipboard clipboard = Toolkit.getDefaultToolkit().getSystemClipboard();
@@ -49,33 +120,21 @@ public class ClipboardWatcher {
                                 if (history.size() > MAX_HISTORY)
                                     history.remove(history.size() - 1);
                             }
-                            System.out.println("Copied: " + data.substring(0, Math.min(60, data.length())));
+                            saveHistory();
+                            System.out.println("Copied: " + data.substring(0, Math.min(60, data.length())).replace("\n", "↵"));
                         }
                     }
-                } catch (IllegalStateException e) {
-                    // Clipboard temporarily unavailable (another app holds it) -- just retry
+                } catch (IllegalStateException ignored) {
+                    // clipboard temporarily locked by another app
                 } catch (Exception ignored) {}
                 try { Thread.sleep(200); } catch (InterruptedException ignored) {}
             }
         });
-        clipboardPoller.setDaemon(true);
-        clipboardPoller.start();
-
-        setupSystemTray();
-        buildPopupWindow();
-        startSocketListener();
-        startFileTriggerWatcher();
-
-        System.out.println("Clipboard Manager started.");
-        System.out.println("  Trigger via command: java ClipboardWatcher trigger");
-        System.out.println("  Trigger via file   : touch " + TRIGGER_FILE);
-        System.out.println("  Bind either to a hotkey in GNOME/KDE: Settings → Keyboard → Custom Shortcuts");
-        Thread.sleep(Long.MAX_VALUE);
+        t.setDaemon(true);
+        t.start();
     }
 
-    // ─── Socket listener ─────────────────────────────────────────────────────
-    // The trigger process sends "toggle" and then BLOCKS waiting for "closed".
-    // We store its writer and send "closed" when the popup is dismissed.
+    // ─── Socket trigger ──────────────────────────────────────────────────────
 
     private static void startSocketListener() {
         Thread t = new Thread(() -> {
@@ -84,24 +143,21 @@ public class ClipboardWatcher {
                 File portFile = new File(System.getProperty("java.io.tmpdir"), "clipboard_watcher.port");
                 try (PrintWriter pw = new PrintWriter(portFile)) { pw.print(port); }
                 portFile.deleteOnExit();
-                System.out.println("  Socket on localhost:" + port + " (port in " + portFile + ")");
+                System.out.println("  Socket on localhost:" + port);
 
                 while (true) {
-                    // Accept connection but don't close it yet — keep writer for dismiss signal
                     Socket s = server.accept();
                     BufferedReader br = new BufferedReader(new InputStreamReader(s.getInputStream()));
                     PrintWriter reply = new PrintWriter(s.getOutputStream(), true);
                     String msg = br.readLine();
                     if ("toggle".equals(msg)) {
                         if (popupWindow != null && popupWindow.isVisible()) {
-                            dismissPopup(); // already open → just close (no trigger process waiting)
+                            dismissPopup();
                             reply.println("closed");
                             s.close();
                         } else {
-                            // Store the reply writer; dismissPopup() will send "closed" and close it
                             triggerReplyWriter = reply;
                             showPopup();
-                            // Socket stays open until dismissPopup() fires
                         }
                     } else {
                         reply.println("unknown");
@@ -116,24 +172,20 @@ public class ClipboardWatcher {
         t.start();
     }
 
-    // Trigger process: send toggle, then block until "closed" is received, then exit.
     private static void sendSocketTrigger() {
         File portFile = new File(System.getProperty("java.io.tmpdir"), "clipboard_watcher.port");
         try {
             int port = Integer.parseInt(Files.readString(portFile.toPath()).trim());
             try (Socket s = new Socket(InetAddress.getLoopbackAddress(), port);
-                 PrintWriter pw  = new PrintWriter(s.getOutputStream(), true);
+                 PrintWriter pw = new PrintWriter(s.getOutputStream(), true);
                  BufferedReader br = new BufferedReader(new InputStreamReader(s.getInputStream()))) {
                 pw.println("toggle");
-                br.readLine(); // blocks until main process sends "closed"
-                // process exits naturally here
+                br.readLine();
             }
         } catch (Exception e) {
             System.err.println("Could not connect — is ClipboardWatcher running? " + e.getMessage());
         }
     }
-
-    // ─── File trigger watcher ────────────────────────────────────────────────
 
     private static void startFileTriggerWatcher() {
         Thread t = new Thread(() -> {
@@ -163,7 +215,7 @@ public class ClipboardWatcher {
         t.start();
     }
 
-    // ─── Popup Window ────────────────────────────────────────────────────────
+    // ─── Popup: build (once) ─────────────────────────────────────────────────
 
     private static void buildPopupWindow() {
         SwingUtilities.invokeLater(() -> {
@@ -175,10 +227,10 @@ public class ClipboardWatcher {
             root.setBackground(new Color(18, 18, 24));
             root.setBorder(new CompoundBorder(
                     new LineBorder(new Color(80, 80, 120), 1),
-                    new EmptyBorder(0, 0, 8, 0)
+                    new EmptyBorder(0, 0, 0, 0)
             ));
 
-            // ── Header ──
+            // ── Header bar ──────────────────────────────────────────────────
             JPanel header = new JPanel(new BorderLayout());
             header.setBackground(new Color(28, 28, 38));
             header.setBorder(new EmptyBorder(10, 16, 10, 12));
@@ -188,40 +240,29 @@ public class ClipboardWatcher {
             title.setForeground(new Color(200, 200, 230));
             header.add(title, BorderLayout.WEST);
 
-            // Two independently hoverable hint labels
             JPanel hints = new JPanel(new FlowLayout(FlowLayout.RIGHT, 4, 0));
             hints.setOpaque(false);
 
-            JLabel hintCopy = new JLabel("click to copy");
+            JLabel hintCopy = new JLabel("Click to copy");
             hintCopy.setFont(new Font("Segoe UI", Font.PLAIN, 10));
             hintCopy.setForeground(new Color(100, 100, 130));
             hintCopy.addMouseListener(new MouseAdapter() {
-                @Override public void mouseEntered(MouseEvent e) {
-                    hintCopy.setForeground(new Color(140, 200, 255));
-                }
-                @Override public void mouseExited(MouseEvent e) {
-                    hintCopy.setForeground(new Color(100, 100, 130));
-                }
+                @Override public void mouseEntered(MouseEvent e) { hintCopy.setForeground(new Color(140, 200, 255)); }
+                @Override public void mouseExited(MouseEvent e)  { hintCopy.setForeground(new Color(100, 100, 130)); }
             });
 
             JLabel sep = new JLabel("·");
             sep.setFont(new Font("Segoe UI", Font.PLAIN, 10));
             sep.setForeground(new Color(60, 60, 80));
 
-            JLabel hintClose = new JLabel("Esc to close");
+            JLabel hintClose = new JLabel("Close");
             hintClose.setFont(new Font("Segoe UI", Font.PLAIN, 10));
             hintClose.setForeground(new Color(100, 100, 130));
             hintClose.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
             hintClose.addMouseListener(new MouseAdapter() {
-                @Override public void mouseEntered(MouseEvent e) {
-                    hintClose.setForeground(new Color(180, 160, 255));
-                }
-                @Override public void mouseExited(MouseEvent e) {
-                    hintClose.setForeground(new Color(100, 100, 130));
-                }
-                @Override public void mouseClicked(MouseEvent e) {
-                    dismissPopup();
-                }
+                @Override public void mouseEntered(MouseEvent e) { hintClose.setForeground(new Color(180, 160, 255)); }
+                @Override public void mouseExited(MouseEvent e)  { hintClose.setForeground(new Color(100, 100, 130)); }
+                @Override public void mouseClicked(MouseEvent e) { dismissPopup(); }
             });
 
             hints.add(hintCopy);
@@ -229,20 +270,64 @@ public class ClipboardWatcher {
             hints.add(hintClose);
             header.add(hints, BorderLayout.EAST);
 
-            root.add(header, BorderLayout.NORTH);
+            // ── Search bar ──────────────────────────────────────────────────
+            JPanel searchBar = new JPanel(new BorderLayout());
+            searchBar.setBackground(new Color(22, 22, 32));
+            searchBar.setBorder(new EmptyBorder(6, 12, 6, 12));
 
-            // ── List Panel ──
-            JPanel listPanel = new JPanel();
+            searchField = new JTextField();
+            searchField.setFont(new Font("Segoe UI", Font.PLAIN, 12));
+            searchField.setForeground(new Color(210, 215, 240));
+            searchField.setBackground(new Color(30, 30, 44));
+            searchField.setCaretColor(new Color(160, 140, 255));
+            searchField.setBorder(new CompoundBorder(
+                    new LineBorder(new Color(60, 55, 90), 1),
+                    new EmptyBorder(5, 10, 5, 10)
+            ));
+            // Placeholder text
+            searchField.setText("Search…");
+            searchField.setForeground(new Color(80, 80, 110));
+            searchField.addFocusListener(new FocusAdapter() {
+                @Override public void focusGained(FocusEvent e) {
+                    if (searchField.getText().equals("Search…")) {
+                        searchField.setText("");
+                        searchField.setForeground(new Color(210, 215, 240));
+                    }
+                }
+                @Override public void focusLost(FocusEvent e) {
+                    if (searchField.getText().isEmpty()) {
+                        searchField.setText("Search…");
+                        searchField.setForeground(new Color(80, 80, 110));
+                    }
+                }
+            });
+            searchField.getDocument().addDocumentListener(new DocumentListener() {
+                public void insertUpdate(DocumentEvent e)  { refreshList(); }
+                public void removeUpdate(DocumentEvent e)  { refreshList(); }
+                public void changedUpdate(DocumentEvent e) { refreshList(); }
+            });
+            // Esc from search field also closes
+            searchField.addKeyListener(new KeyAdapter() {
+                @Override public void keyPressed(KeyEvent e) {
+                    if (e.getKeyCode() == KeyEvent.VK_ESCAPE) dismissPopup();
+                }
+            });
+
+            searchBar.add(searchField, BorderLayout.CENTER);
+
+            // ── List (scrollable) ────────────────────────────────────────────
+            listPanel = new JPanel();
             listPanel.setLayout(new BoxLayout(listPanel, BoxLayout.Y_AXIS));
             listPanel.setBackground(new Color(18, 18, 24));
 
-            JScrollPane scroll = new JScrollPane(listPanel);
-            scroll.setBorder(BorderFactory.createEmptyBorder());
-            scroll.setBackground(new Color(18, 18, 24));
-            scroll.getViewport().setBackground(new Color(18, 18, 24));
-            scroll.setVerticalScrollBarPolicy(ScrollPaneConstants.VERTICAL_SCROLLBAR_AS_NEEDED);
-            scroll.setHorizontalScrollBarPolicy(ScrollPaneConstants.HORIZONTAL_SCROLLBAR_NEVER);
-            scroll.getVerticalScrollBar().setUI(new javax.swing.plaf.basic.BasicScrollBarUI() {
+            listScroll = new JScrollPane(listPanel);
+            listScroll.setBorder(BorderFactory.createEmptyBorder());
+            listScroll.setBackground(new Color(18, 18, 24));
+            listScroll.getViewport().setBackground(new Color(18, 18, 24));
+            listScroll.setVerticalScrollBarPolicy(ScrollPaneConstants.VERTICAL_SCROLLBAR_AS_NEEDED);
+            listScroll.setHorizontalScrollBarPolicy(ScrollPaneConstants.HORIZONTAL_SCROLLBAR_NEVER);
+            listScroll.getVerticalScrollBar().setUnitIncrement(16);
+            listScroll.getVerticalScrollBar().setUI(new javax.swing.plaf.basic.BasicScrollBarUI() {
                 @Override protected void configureScrollBarColors() {
                     thumbColor = new Color(70, 70, 100);
                     trackColor = new Color(25, 25, 35);
@@ -254,25 +339,27 @@ public class ClipboardWatcher {
                 }
             });
 
-            root.add(scroll, BorderLayout.CENTER);
+            // ── Top section: header + search ─────────────────────────────────
+            JPanel top = new JPanel(new BorderLayout());
+            top.add(header, BorderLayout.NORTH);
+            top.add(searchBar, BorderLayout.SOUTH);
 
-            // ── Escape key ──
-            // Input map on the root panel (works when a child has focus)
+            root.add(top, BorderLayout.NORTH);
+            root.add(listScroll, BorderLayout.CENTER);
+
+            // ── Escape key (input map + direct listener) ─────────────────────
             KeyStroke esc = KeyStroke.getKeyStroke(KeyEvent.VK_ESCAPE, 0);
             root.getInputMap(JComponent.WHEN_IN_FOCUSED_WINDOW).put(esc, "dismiss");
             root.getActionMap().put("dismiss", new AbstractAction() {
                 public void actionPerformed(ActionEvent e) { dismissPopup(); }
             });
-
-            // Direct KeyListener on the JWindow itself -- catches Esc even when
-            // no child component has focus (common on Linux/X11)
             popupWindow.addKeyListener(new KeyAdapter() {
                 @Override public void keyPressed(KeyEvent e) {
                     if (e.getKeyCode() == KeyEvent.VK_ESCAPE) dismissPopup();
                 }
             });
 
-            // ── Click outside ──
+            // ── Click outside ────────────────────────────────────────────────
             Toolkit.getDefaultToolkit().addAWTEventListener(event -> {
                 if (popupWindow.isVisible() && event instanceof MouseEvent) {
                     MouseEvent me = (MouseEvent) event;
@@ -287,43 +374,38 @@ public class ClipboardWatcher {
         });
     }
 
+    // ─── Popup: show ─────────────────────────────────────────────────────────
+
     private static void showPopup() {
         SwingUtilities.invokeLater(() -> {
             if (popupWindow == null) return;
 
-            JScrollPane scroll = (JScrollPane)
-                    ((BorderLayout) popupWindow.getContentPane().getLayout())
-                            .getLayoutComponent(BorderLayout.CENTER);
-            JPanel listPanel = (JPanel) scroll.getViewport().getView();
-            listPanel.removeAll();
+            // Clear search
+            searchField.setText("Search…");
+            searchField.setForeground(new Color(80, 80, 110));
 
-            synchronized (history) {
-                if (history.isEmpty()) {
-                    JLabel empty = new JLabel("  Nothing copied yet…");
-                    empty.setFont(new Font("Segoe UI", Font.ITALIC, 12));
-                    empty.setForeground(new Color(100, 100, 130));
-                    empty.setBorder(new EmptyBorder(16, 16, 16, 16));
-                    listPanel.add(empty);
-                } else {
-                    for (int i = 0; i < history.size(); i++)
-                        listPanel.add(createHistoryItem(i, history.get(i)));
-                }
-            }
+            refreshList();
 
-            listPanel.revalidate();
-            listPanel.repaint();
-
+            // Size: fixed width, height capped at POPUP_MAX_H
             Dimension screen = Toolkit.getDefaultToolkit().getScreenSize();
-            int w = 520;
-            int itemH = Math.max(1, Math.min(history.size(), MAX_HISTORY));
-            int h = Math.min(44 + itemH * 58 + 8, screen.height - 120);
+            int w = 560;
+            int listCount = listPanel.getComponentCount();
+            int naturalH = HEADER_H + SEARCH_H + listCount * ITEM_H + 8;
+            int h = Math.min(naturalH, POPUP_MAX_H);
+            h = Math.max(h, HEADER_H + SEARCH_H + ITEM_H + 8); // at least 1 row
+
             popupWindow.setSize(w, h);
             popupWindow.setLocation((screen.width - w) / 2, 60);
             popupWindow.setVisible(true);
             popupWindow.toFront();
+
+            // Reset scroll to top
+            SwingUtilities.invokeLater(() ->
+                    listScroll.getVerticalScrollBar().setValue(0));
+
+            // Focus the search field so you can type immediately
+            searchField.requestFocusInWindow();
             popupWindow.requestFocus();
-            // Request focus on the window AND the root panel so both
-            // the KeyListener and the input map bindings work on Linux
             popupWindow.getRootPane().requestFocusInWindow();
 
             popupWindow.setOpacity(0f);
@@ -337,7 +419,48 @@ public class ClipboardWatcher {
         });
     }
 
-    /** Hides the popup with fade-out, then signals the trigger process to exit. */
+    /** Rebuild the list panel based on current search text. */
+    private static void refreshList() {
+        SwingUtilities.invokeLater(() -> {
+            if (listPanel == null) return;
+            String query = searchField.getText().trim().toLowerCase();
+            boolean isPlaceholder = query.equals("search…") || query.isEmpty();
+
+            List<String> filtered;
+            synchronized (history) {
+                filtered = isPlaceholder
+                        ? new ArrayList<>(history)
+                        : history.stream()
+                        .filter(e -> e.toLowerCase().contains(query))
+                        .collect(Collectors.toList());
+            }
+
+            listPanel.removeAll();
+            if (filtered.isEmpty()) {
+                JLabel empty = new JLabel(isPlaceholder ? "  Nothing copied yet…" : "  No matches found");
+                empty.setFont(new Font("Segoe UI", Font.ITALIC, 12));
+                empty.setForeground(new Color(100, 100, 130));
+                empty.setBorder(new EmptyBorder(16, 16, 16, 16));
+                listPanel.add(empty);
+            } else {
+                for (int i = 0; i < filtered.size(); i++)
+                    listPanel.add(createHistoryItem(i, filtered.get(i)));
+            }
+            listPanel.revalidate();
+            listPanel.repaint();
+
+            // Resize popup height to fit new filtered count, still capped
+            if (popupWindow != null && popupWindow.isVisible()) {
+                int count = Math.max(1, filtered.isEmpty() ? 1 : filtered.size());
+                int naturalH = HEADER_H + SEARCH_H + count * ITEM_H + 8;
+                int h = Math.min(naturalH, POPUP_MAX_H);
+                Dimension cur = popupWindow.getSize();
+                popupWindow.setSize(cur.width, h);
+            }
+        });
+    }
+
+    /** Hides the popup and signals the trigger process to exit. */
     private static void dismissPopup() {
         if (popupWindow == null || !popupWindow.isVisible()) return;
         Timer fadeOut = new Timer(16, null);
@@ -347,7 +470,6 @@ public class ClipboardWatcher {
                 popupWindow.setOpacity(0f);
                 popupWindow.setVisible(false);
                 fadeOut.stop();
-                // Signal waiting trigger process (if any) to exit
                 PrintWriter reply = triggerReplyWriter;
                 if (reply != null) {
                     reply.println("closed");
@@ -360,12 +482,12 @@ public class ClipboardWatcher {
         fadeOut.start();
     }
 
-    // ─── History Row ─────────────────────────────────────────────────────────
+    // ─── History row ─────────────────────────────────────────────────────────
 
     private static JPanel createHistoryItem(int index, String text) {
         JPanel row = new JPanel(new BorderLayout(10, 0));
-        row.setMaximumSize(new Dimension(Integer.MAX_VALUE, 54));
-        row.setPreferredSize(new Dimension(480, 54));
+        row.setMaximumSize(new Dimension(Integer.MAX_VALUE, ITEM_H));
+        row.setPreferredSize(new Dimension(500, ITEM_H));
         row.setBackground(new Color(18, 18, 24));
         row.setBorder(new EmptyBorder(5, 12, 0, 12));
         row.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
@@ -373,7 +495,7 @@ public class ClipboardWatcher {
         JLabel badge = new JLabel(String.valueOf(index + 1));
         badge.setFont(new Font("Segoe UI", Font.BOLD, 10));
         badge.setForeground(new Color(120, 100, 200));
-        badge.setPreferredSize(new Dimension(18, 40));
+        badge.setPreferredSize(new Dimension(22, 40));
         badge.setHorizontalAlignment(SwingConstants.CENTER);
 
         JPanel card = new JPanel(new BorderLayout());
@@ -384,7 +506,7 @@ public class ClipboardWatcher {
         ));
 
         String preview = text.replaceAll("\\s+", " ").trim();
-        if (preview.length() > 72) preview = preview.substring(0, 69) + "…";
+        if (preview.length() > 76) preview = preview.substring(0, 73) + "…";
 
         JLabel label = new JLabel(preview);
         label.setFont(new Font("Monospaced", Font.PLAIN, 11));
@@ -447,7 +569,7 @@ public class ClipboardWatcher {
         t.start();
     }
 
-    // ─── System Tray ─────────────────────────────────────────────────────────
+    // ─── System tray ─────────────────────────────────────────────────────────
 
     private static void setupSystemTray() {
         if (!SystemTray.isSupported()) return;
@@ -457,14 +579,16 @@ public class ClipboardWatcher {
                 trayIcon.setImageAutoSize(true);
 
                 PopupMenu menu = new PopupMenu();
-                MenuItem showItem = new MenuItem("Show History");
-                showItem.addActionListener(e -> showPopup());
+                MenuItem showItem  = new MenuItem("Show History");
                 MenuItem clearItem = new MenuItem("Clear History");
+                MenuItem exitItem  = new MenuItem("Exit");
+
+                showItem.addActionListener(e -> showPopup());
                 clearItem.addActionListener(e -> {
                     synchronized (history) { history.clear(); }
                     lastValue = "";
+                    saveHistory();
                 });
-                MenuItem exitItem = new MenuItem("Exit");
                 exitItem.addActionListener(e -> System.exit(0));
 
                 menu.add(showItem);
@@ -474,9 +598,7 @@ public class ClipboardWatcher {
                 trayIcon.setPopupMenu(menu);
                 trayIcon.addActionListener(e -> showPopup());
                 SystemTray.getSystemTray().add(trayIcon);
-            } catch (Exception e) {
-                e.printStackTrace();
-            }
+            } catch (Exception e) { e.printStackTrace(); }
         });
     }
 
