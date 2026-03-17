@@ -20,7 +20,6 @@ public class ClipboardWatcher {
     private static final int ITEM_H         = 54;
     private static final int HEADER_H       = 44;
     private static final int SEARCH_H       = 42;
-    public static final String CLIPBOARD_HISTORY_FILE_NAME = "clipboard_history.txt";
 
     private static final List<String> history = new ArrayList<>();
     private static String lastValue = "";
@@ -33,8 +32,9 @@ public class ClipboardWatcher {
     private static volatile PrintWriter triggerReplyWriter = null;
 
     // History file lives next to the .class / .java file
-    private static final Path HISTORY_FILE  = Paths.get(CLIPBOARD_HISTORY_TXT);
-    private static final Path TRIGGER_FILE  = Paths.get(System.getProperty("user.home"), ".clipboard_trigger");
+    private static final Path HISTORY_FILE  = Paths.get("clipboard_history.txt");
+    private static final Path TRIGGER_FILE  =
+            Paths.get(System.getProperty("user.home"), ".clipboard_trigger");
 
     // ─── Entry point ─────────────────────────────────────────────────────────
 
@@ -394,7 +394,15 @@ public class ClipboardWatcher {
                 }
             });
 
-            // ── Click outside ────────────────────────────────────────────────
+            // ── Close on focus lost ──────────────────────────────────────────
+            // Covers: clicking outside, Alt+Tab, switching to another app, etc.
+            popupWindow.addWindowFocusListener(new WindowAdapter() {
+                @Override public void windowLostFocus(WindowEvent e) {
+                    dismissPopup();
+                }
+            });
+
+            // ── Click outside (fallback for window managers that don't fire windowLostFocus) ──
             Toolkit.getDefaultToolkit().addAWTEventListener(event -> {
                 if (popupWindow.isVisible() && event instanceof MouseEvent) {
                     MouseEvent me = (MouseEvent) event;
@@ -627,7 +635,7 @@ public class ClipboardWatcher {
         String origText = label.getText();
         card.setBackground(new Color(30, 55, 35));
         label.setForeground(new Color(100, 220, 130));
-        label.setText("✓  Copied!");
+        label.setText("✓  Copied (" + origText.length() + " chars)");
         Timer t = new Timer(700, e -> {
             card.setBackground(original);
             label.setForeground(new Color(200, 210, 230));
