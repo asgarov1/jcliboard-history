@@ -20,6 +20,7 @@ public class ClipboardWatcher {
     private static final int ITEM_H         = 54;
     private static final int HEADER_H       = 44;
     private static final int SEARCH_H       = 42;
+    public static final String CLIPBOARD_HISTORY_FILE_NAME = "clipboard_history.txt";
 
     private static final List<String> history = new ArrayList<>();
     private static String lastValue = "";
@@ -32,9 +33,8 @@ public class ClipboardWatcher {
     private static volatile PrintWriter triggerReplyWriter = null;
 
     // History file lives next to the .class / .java file
-    private static final Path HISTORY_FILE  = Paths.get("clipboard_history.txt");
-    private static final Path TRIGGER_FILE  =
-            Paths.get(System.getProperty("user.home"), ".clipboard_trigger");
+    private static final Path HISTORY_FILE  = Paths.get(CLIPBOARD_HISTORY_TXT);
+    private static final Path TRIGGER_FILE  = Paths.get(System.getProperty("user.home"), ".clipboard_trigger");
 
     // ─── Entry point ─────────────────────────────────────────────────────────
 
