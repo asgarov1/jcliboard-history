@@ -254,10 +254,32 @@ public class ClipboardWatcher {
             header.setBackground(new Color(28, 28, 38));
             header.setBorder(new EmptyBorder(10, 16, 10, 12));
 
+            JPanel titleBlock = new JPanel();
+            titleBlock.setLayout(new BoxLayout(titleBlock, BoxLayout.Y_AXIS));
+            titleBlock.setOpaque(false);
+
             JLabel title = new JLabel("📋  Clipboard History");
             title.setFont(new Font("Segoe UI", Font.BOLD, 13));
             title.setForeground(new Color(200, 200, 230));
-            header.add(title, BorderLayout.WEST);
+            title.setAlignmentX(Component.LEFT_ALIGNMENT);
+
+            JTextPane subtitle = new JTextPane();
+            subtitle.setText("Bei Fragen: asgarov1@gmail.com");
+            subtitle.setFont(new Font("Segoe UI", Font.PLAIN, 10));
+            subtitle.setForeground(new Color(100, 100, 140));
+            subtitle.setBackground(new Color(28, 28, 38)); // match header bg
+            subtitle.setEditable(false);
+            subtitle.setOpaque(true);
+            subtitle.setBorder(new EmptyBorder(3, 0, 0, 0));
+            subtitle.setMargin(new Insets(0, 0, 0, 0));
+            subtitle.setAlignmentX(Component.LEFT_ALIGNMENT);
+            subtitle.setHighlighter(new javax.swing.text.DefaultHighlighter());
+            subtitle.setSelectedTextColor(new Color(210, 215, 240));
+            subtitle.setSelectionColor(new Color(80, 60, 160));
+
+            titleBlock.add(title);
+            titleBlock.add(subtitle);
+            header.add(titleBlock, BorderLayout.WEST);
 
             JPanel hints = new JPanel(new FlowLayout(FlowLayout.RIGHT, 4, 0));
             hints.setOpaque(false);
@@ -613,7 +635,7 @@ public class ClipboardWatcher {
             }
             @Override public void mouseClicked(MouseEvent e) {
                 copyToClipboard(text);
-                flashConfirm(card, label);
+                flashConfirm(card, label, text);
             }
         };
         row.addMouseListener(hover);
@@ -630,12 +652,12 @@ public class ClipboardWatcher {
         Toolkit.getDefaultToolkit().getSystemClipboard().setContents(sel, sel);
     }
 
-    private static void flashConfirm(JPanel card, JLabel label) {
+    private static void flashConfirm(JPanel card, JLabel label, String text) {
         Color original = card.getBackground();
         String origText = label.getText();
         card.setBackground(new Color(30, 55, 35));
         label.setForeground(new Color(100, 220, 130));
-        label.setText("✓  Copied (" + origText.length() + " chars)");
+        label.setText("✓  Copied (" + text.length() + " chars)");
         Timer t = new Timer(700, e -> {
             card.setBackground(original);
             label.setForeground(new Color(200, 210, 230));
